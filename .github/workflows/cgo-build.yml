@@ -1,0 +1,108 @@
+name: CGO Build & Sync
+
+on:
+  schedule:
+    - cron: '0 4 * * 1' # Every Monday at 04:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      target_tag: ${{ steps.check.outputs.target_tag }}
+    steps:
+      - name: Check upstream and local tags
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch upstream tags
+          # Using git ls-remote to avoid full fetch
+          LATEST_UPSTREAM=$(git ls-remote --tags --refs https://github.com/smallstep/certificates.git | cut -d/ -f3 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          
+          if [ -z "$LATEST_UPSTREAM" ]; then
+            echo "Error: Could not find valid upstream semver tag."
+            exit 1
+          fi
+
+          echo "Latest upstream tag: $LATEST_UPSTREAM"
+
+          # Check if release exists in this repo with -cgo suffix
+          # We use the GitHub API to check for the release existence
+          # Http status 200 means it exists, 404 means it doesn't.
+          
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${LATEST_UPSTREAM}-cgo")
+          
+          echo "Release check status for ${LATEST_UPSTREAM}-cgo: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" == "404" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "target_tag=$LATEST_UPSTREAM" >> "$GITHUB_OUTPUT"
+            echo "Proceeding to build for $LATEST_UPSTREAM"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${LATEST_UPSTREAM}-cgo already exists. Skipping build."
+          fi
+
+  build-and-release:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout upstream tag
+        uses: actions/checkout@v4
+        with:
+          repository: smallstep/certificates
+          ref: ${{ needs.check-upstream.outputs.target_tag }}
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get clean
+          sudo apt-get update
+          sudo apt-get install -y libpcsclite-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build AMD64
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          echo "Building for AMD64..."
+          make build
+          # Rename/Archive the binary
+          mkdir -p dist
+          tar -czvf dist/step-ca_linux_amd64.tar.gz -C bin step-ca
+
+      - name: Build ARM64
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: arm64
+          CC: aarch64-linux-gnu-gcc
+        run: |
+          echo "Building for ARM64..."
+          # Clean previous build
+          rm -f bin/step-ca
+          make build
+          # Rename/Archive the binary
+          tar -czvf dist/step-ca_linux_arm64.tar.gz -C bin step-ca
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.target_tag }}-cgo
+          name: Release ${{ needs.check-upstream.outputs.target_tag }}-cgo
+          files: |
+            dist/step-ca_linux_amd64.tar.gz
+            dist/step-ca_linux_arm64.tar.gz
+          draft: false
+          prerelease: false
