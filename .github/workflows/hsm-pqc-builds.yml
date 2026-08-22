@@ -37,9 +37,9 @@ jobs:
     steps:
       - name: Create GitHub App token (step-ca-sync-bot)
         id: app
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.REPO_APP_ID }}
+          client-id: ${{ secrets.REPO_APP_ID }}
           private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
 
       # Fresh clone so the rebase never depends on the runner's implicit
@@ -107,9 +107,9 @@ jobs:
     steps:
       - name: Create GitHub App token (step-ca-sync-bot)
         id: app
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.REPO_APP_ID }}
+          client-id: ${{ secrets.REPO_APP_ID }}
           private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
 
       - name: Decide
@@ -204,9 +204,9 @@ jobs:
     steps:
       - name: Create GitHub App token (step-ca-sync-bot)
         id: app
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.REPO_APP_ID }}
+          client-id: ${{ secrets.REPO_APP_ID }}
           private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
 
       - name: Checkout upstream release tag
@@ -216,17 +216,54 @@ jobs:
           ref: ${{ needs.check.outputs.target_tag }}
           fetch-depth: 0
 
-      # Pinned for reproducible builds on the runner image's Ubuntu series.
+      # Pinned for reproducible builds on the runner image's Ubuntu series
+      # (noble).
       - name: Install pinned C toolchains
         run: |
           set -euo pipefail
           HOST="$(uname -m)"
+          case "$HOST" in
+            x86_64)  NATIVE=amd64; CROSS=arm64 ;;
+            aarch64) NATIVE=arm64; CROSS=amd64 ;;
+            *) echo "::error::Unsupported host architecture: ${HOST}"; exit 1 ;;
+          esac
           if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+
+          # Ubuntu noble's main archive (archive.ubuntu.com) does not
+          # distribute index files for the port architectures; they live
+          # on ports.ubuntu.com under the ubuntu-ports/ path. Without
+          # per-source architecture scoping, `dpkg --add-architecture
+          # <cross>` makes `apt-get update` request binary-<cross>/
+          # Packages from the main archive and fail with 404. So: scope
+          # the image's stock sources to the native architecture and
+          # source the cross architecture from the archive that hosts it.
+          STOCK=/etc/apt/sources.list.d/ubuntu.sources
+          if [ ! -f "$STOCK" ]; then
+            echo "::error::Expected ${STOCK} (Ubuntu noble+ image layout)"
+            exit 1
+          fi
+          grep -q '^Architectures:' "$STOCK" \
+            || sed -i "s/^Types: deb$/&\nArchitectures: ${NATIVE}/" "$STOCK"
+
+          if [ "$CROSS" = "arm64" ]; then
+            CROSS_REPO="http://ports.ubuntu.com/ubuntu-ports"
+          else
+            CROSS_REPO="http://archive.ubuntu.com/ubuntu"
+          fi
+          cat > /etc/apt/sources.list.d/hsm-pqc-cross.sources <<EOF
+          Types: deb
+          URIs: ${CROSS_REPO}/
+          Suites: noble noble-updates noble-security
+          Components: main restricted universe multiverse
+          Architectures: ${CROSS}
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
+          $SUDO dpkg --add-architecture "$CROSS"
+          $SUDO apt-get update
 
           case "$HOST" in
             x86_64)
-              $SUDO dpkg --add-architecture arm64
-              $SUDO apt-get update
               $SUDO apt-get install -y --no-install-recommends \
                 gcc=4:13.2.0-7ubuntu1 \
                 crossbuild-essential-arm64=12.10ubuntu1 \
@@ -238,8 +275,6 @@ jobs:
               echo "CC_ARM64=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
               ;;
             aarch64)
-              $SUDO dpkg --add-architecture amd64
-              $SUDO apt-get update
               $SUDO apt-get install -y --no-install-recommends \
                 gcc=4:13.2.0-7ubuntu1 \
                 crossbuild-essential-amd64=12.10ubuntu1 \
@@ -249,10 +284,6 @@ jobs:
                 'libpcsclite-dev:amd64=2.0.3-1build1'
               echo "CC_AMD64=x86_64-linux-gnu-gcc" >> "$GITHUB_ENV"
               echo "CC_ARM64=gcc" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "::error::Unsupported host architecture: ${HOST}"
-              exit 1
               ;;
           esac
           command -v "$CC_AMD64" >/dev/null
@@ -363,9 +394,9 @@ jobs:
     steps:
       - name: Create GitHub App token (step-ca-sync-bot)
         id: app
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.REPO_APP_ID }}
+          client-id: ${{ secrets.REPO_APP_ID }}
           private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
 
       - name: Delete stale -cgo releases
