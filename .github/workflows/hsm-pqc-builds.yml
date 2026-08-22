@@ -273,8 +273,10 @@ jobs:
                 libc6-dev-arm64-cross=2.39-0ubuntu8cross1 \
                 libpcsclite-dev=2.0.3-1build1 \
                 'libpcsclite-dev:arm64=2.0.3-1build1'
-              echo "CC_AMD64=gcc" >> "$GITHUB_ENV"
-              echo "CC_ARM64=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              CC_AMD64=gcc
+              CC_ARM64=aarch64-linux-gnu-gcc
+              # shell vars for the checks below; GITHUB_ENV for later steps only
+              { echo "CC_AMD64=${CC_AMD64}"; echo "CC_ARM64=${CC_ARM64}"; } >> "$GITHUB_ENV"
               ;;
             aarch64)
               $SUDO apt-get install -y --no-install-recommends \
@@ -284,8 +286,10 @@ jobs:
                 libc6-dev-amd64-cross=2.39-0ubuntu8cross1 \
                 libpcsclite-dev=2.0.3-1build1 \
                 'libpcsclite-dev:amd64=2.0.3-1build1'
-              echo "CC_AMD64=x86_64-linux-gnu-gcc" >> "$GITHUB_ENV"
-              echo "CC_ARM64=gcc" >> "$GITHUB_ENV"
+              CC_AMD64=x86_64-linux-gnu-gcc
+              CC_ARM64=gcc
+              # shell vars for the checks below; GITHUB_ENV for later steps only
+              { echo "CC_AMD64=${CC_AMD64}"; echo "CC_ARM64=${CC_ARM64}"; } >> "$GITHUB_ENV"
               ;;
           esac
           command -v "$CC_AMD64" >/dev/null
