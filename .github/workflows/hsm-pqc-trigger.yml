@@ -1,0 +1,26 @@
+# Dispatches the HSM + PQC Package Builder (which lives on the
+# hsm+pqc-builds branch) once a month. Workflow schedules only fire
+# on the default branch, so the monthly cron lives here.
+name: HSM + PQC Trigger
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"
+
+permissions:
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { data } = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "build-hsm-pqc.yml",
+              ref: "hsm+pqc-builds",
+            });
+            console.log(`Dispatched: ${data.html_url}`);
