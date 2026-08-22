@@ -1,0 +1,421 @@
+# step-ca HSM/PQC package builder.
+#
+# Builds step-ca with CGO enabled (PKCS#11 / YubiKey PIV / HSM) on a Go
+# toolchain new enough for ML-KEM, and publishes the result as a
+# `<tag>-cgo` release for the newest upstream stable tag. At most the
+# three newest stable -cgo releases are kept; older ones are pruned.
+
+name: HSM + PQC Package Builder
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild the newest stable tag even if its -cgo release already exists
+        required: false
+        type: boolean
+        default: 'false'
+
+concurrency:
+  group: hsm-pqc-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/smallstep/certificates.git
+  GO_VERSION: "1.25.8"
+
+jobs:
+  # -------------------------------------------------------------------------
+  sync-upstream:
+    name: Keep hsm+pqc-builds mirror of upstream master
+    runs-on: [github-runner-scale-set]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub App token (step-ca-sync-bot)
+        id: app
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.REPO_APP_ID }}
+          private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
+
+      # Fresh clone so the rebase never depends on the runner's implicit
+      # checkout. Fork-side commits on this branch (if any) are rebased
+      # onto upstream master and survive; no other branch is touched
+      # (master stays a clean upstream mirror).
+      - name: Sync hsm+pqc-builds to upstream master
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          cat > ./git-askpass.sh <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *Username*) echo "x-access-token" ;;
+            *Password*) echo "$APP_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          EOF
+          chmod +x ./git-askpass.sh
+          export GIT_ASKPASS="$PWD/git-askpass.sh" GIT_TERMINAL_PROMPT=0
+
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          cd "$WORK"
+          git init -q
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git remote add upstream "${UPSTREAM}"
+          git fetch -q upstream '+refs/heads/master:refs/remotes/upstream/master'
+          git fetch -q origin 'refs/heads/hsm+pqc-builds:refs/heads/hsm+pqc-builds'
+          git checkout -q hsm+pqc-builds
+          if git merge-base --is-ancestor HEAD upstream/master; then
+            # No fork-side commits: fast-forward this branch to upstream master.
+            git reset --hard upstream/master
+          else
+            # Fork-side commits exist on this branch: rebase them onto
+            # upstream master.
+            git rebase upstream/master
+          fi
+
+          git config user.name "step-ca-sync-bot"
+          git config user.email "step-ca-sync-bot@users.noreply.github.com"
+          git push --force origin "HEAD:refs/heads/hsm+pqc-builds"
+
+          want="$(git rev-parse HEAD)"
+          got="$(git ls-remote origin 'refs/heads/hsm+pqc-builds' | cut -f1)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::Push verification failed: want $want, got ${got:-<absent>}"
+            exit 1
+          fi
+          echo "hsm+pqc-builds -> $got"
+
+  # -------------------------------------------------------------------------
+  check:
+    name: Decide build target and prune set
+    runs-on: [github-runner-scale-set]
+    timeout-minutes: 10
+    needs: sync-upstream
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      target_tag: ${{ steps.decide.outputs.target_tag }}
+      prune_tags: ${{ steps.decide.outputs.prune_tags }}
+    steps:
+      - name: Create GitHub App token (step-ca-sync-bot)
+        id: app
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.REPO_APP_ID }}
+          private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
+
+      - name: Decide
+        id: decide
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_API="https://api.github.com/repos/${{ github.repository }}/releases"
+
+          # Newest-first stable (non-rc) upstream tags.
+          mapfile -t STABLE < <(
+            git ls-remote --tags --refs "${UPSTREAM}" \
+              | awk '{print $2}' | sed 's#refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV
+          )
+          if [ "${#STABLE[@]}" -lt 1 ]; then
+            echo "::error::No stable upstream tags found"
+            exit 1
+          fi
+          TOP3=("${STABLE[@]:0:3}")
+          TOP3_LINE="$(printf ' %s ' "${TOP3[@]}")"
+
+          in_top3() {
+            case "$TOP3_LINE" in
+              *" $1 "*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # -cgo releases published in this repo (newest first).
+          mapfile -t CGO_RELEASES < <(
+            curl -s -H "Authorization: Bearer ${APP_TOKEN}" \
+                 -H 'Accept: application/vnd.github+json' \
+                 "${RELEASE_API}?per_page=100" \
+              | grep -oE '"tag_name":"[^"]+"' \
+              | sed 's/"tag_name":"//; s/"$//' \
+              | grep -E '-cgo$' || true
+          )
+
+          FORCE="${{ inputs.force_rebuild }}"
+
+          SHOULD_BUILD=false
+          TARGET=""
+          REASON=""
+          if [ "$FORCE" = "true" ]; then
+            TARGET="${STABLE[0]}"
+            SHOULD_BUILD=true
+            REASON="force_rebuild -> rebuild ${TARGET}"
+          else
+            for t in "${STABLE[@]}"; do
+              if ! printf '%s\n' "${CGO_RELEASES[@]}" | grep -qx "${t}-cgo"; then
+                TARGET="$t"
+                break
+              fi
+            done
+            if [ -n "$TARGET" ]; then
+              if in_top3 "$TARGET"; then
+                SHOULD_BUILD=true
+                REASON="stable ${TARGET} without -cgo release"
+              else
+                REASON="${TARGET} is older than the three newest stable tags; nothing to build"
+              fi
+            else
+              REASON="newest stable ${STABLE[0]} already published"
+            fi
+          fi
+
+          PRUNE=""
+          for t in "${CGO_RELEASES[@]}"; do
+            in_top3 "${t%-cgo}" || PRUNE="${PRUNE} ${t}"
+          done
+          PRUNE="${PRUNE# }"
+
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "target_tag=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "prune_tags=${PRUNE}" >> "$GITHUB_OUTPUT"
+          echo "reason: ${REASON}"
+          echo "top3 stable: ${TOP3[*]}"
+          echo "published -cgo: ${CGO_RELEASES[*]:-<none>}"
+          echo "target: ${TARGET:-<none>}; build: ${SHOULD_BUILD}; prune: ${PRUNE:-<none>}"
+
+  # -------------------------------------------------------------------------
+  build:
+    name: Build step-ca (linux amd64 + arm64, CGO)
+    runs-on: [github-runner-scale-set]
+    timeout-minutes: 45
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub App token (step-ca-sync-bot)
+        id: app
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.REPO_APP_ID }}
+          private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
+
+      - name: Checkout upstream release tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: smallstep/certificates
+          ref: ${{ needs.check.outputs.target_tag }}
+          fetch-depth: 0
+
+      # Pinned for reproducible builds on the runner image's Ubuntu series.
+      - name: Install pinned C toolchains
+        run: |
+          set -euo pipefail
+          HOST="$(uname -m)"
+          if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+
+          case "$HOST" in
+            x86_64)
+              $SUDO dpkg --add-architecture arm64
+              $SUDO apt-get update
+              $SUDO apt-get install -y --no-install-recommends \
+                gcc=4:13.2.0-7ubuntu1 \
+                crossbuild-essential-arm64=12.10ubuntu1 \
+                gcc-aarch64-linux-gnu=4:13.2.0-7ubuntu1 \
+                libc6-dev-arm64-cross=2.39-0ubuntu8cross1 \
+                libpcsclite-dev=2.0.3-1build1 \
+                'libpcsclite-dev:arm64=2.0.3-1build1'
+              echo "CC_AMD64=gcc" >> "$GITHUB_ENV"
+              echo "CC_ARM64=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              ;;
+            aarch64)
+              $SUDO dpkg --add-architecture amd64
+              $SUDO apt-get update
+              $SUDO apt-get install -y --no-install-recommends \
+                gcc=4:13.2.0-7ubuntu1 \
+                crossbuild-essential-amd64=12.10ubuntu1 \
+                gcc-x86_64-linux-gnu=4:13.2.0-7ubuntu1 \
+                libc6-dev-amd64-cross=2.39-0ubuntu8cross1 \
+                libpcsclite-dev=2.0.3-1build1 \
+                'libpcsclite-dev:amd64=2.0.3-1build1'
+              echo "CC_AMD64=x86_64-linux-gnu-gcc" >> "$GITHUB_ENV"
+              echo "CC_ARM64=gcc" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::Unsupported host architecture: ${HOST}"
+              exit 1
+              ;;
+          esac
+          command -v "$CC_AMD64" >/dev/null
+          command -v "$CC_ARM64" >/dev/null
+          echo "CC_AMD64=$CC_AMD64 CC_ARM64=$CC_ARM64"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build linux/amd64
+        run: |
+          set -euo pipefail
+          unset GITHUB_REF # version is derived from the checked-out tag
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=1 CC="$CC_AMD64" make build
+          machine="$(od -An -j18 -N2 -tu2 bin/step-ca | tr -d ' ')"
+          [ "$machine" = "62" ] || { echo "::error::amd64 binary is not x86_64 ELF (machine ${machine})"; exit 1; }
+          mkdir -p dist
+          tar -czf dist/step-ca_linux_amd64.tar.gz -C bin step-ca
+          echo "Built amd64: $(ls -lh dist/step-ca_linux_amd64.tar.gz)"
+
+      - name: Build linux/arm64
+        run: |
+          set -euo pipefail
+          rm -f bin/step-ca
+          unset GITHUB_REF
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC="$CC_ARM64" make build
+          machine="$(od -An -j18 -N2 -tu2 bin/step-ca | tr -d ' ')"
+          [ "$machine" = "183" ] || { echo "::error::arm64 binary is not AArch64 ELF (machine ${machine})"; exit 1; }
+          tar -czf dist/step-ca_linux_arm64.tar.gz -C bin step-ca
+          echo "Built arm64: $(ls -lh dist/step-ca_linux_arm64.tar.gz)"
+
+      - name: Verify HSM and PQC support are linked
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            tar -xzOf "dist/step-ca_linux_${arch}.tar.gz" step-ca > "/tmp/step-ca-${arch}"
+            grep -qaE 'pcsc|pkcs11' "/tmp/step-ca-${arch}" \
+              || { echo "::error::${arch}: no PCSC/PKCS#11 symbols (CGO not compiled in)"; exit 1; }
+            grep -qa 'mlkem' "/tmp/step-ca-${arch}" \
+              || { echo "::error::${arch}: no ML-KEM symbols (Go toolchain too old for PQC)"; exit 1; }
+            echo "${arch}: PCSC/PKCS#11 and ML-KEM present"
+          done
+
+      - name: Smoke test on host architecture
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)  B=/tmp/step-ca-amd64 ;;
+            aarch64) B=/tmp/step-ca-arm64 ;;
+            *) echo "::error::Unsupported host arch"; exit 1 ;;
+          esac
+          "$B" version
+          GODEBUG=tlsmlkem768=1 "$B" version
+
+      - name: Publish <tag>-cgo release
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.check.outputs.target_tag }}-cgo"
+          API="https://api.github.com/repos/${{ github.repository }}"
+
+          # Idempotent re-publish: remove any existing release for this name.
+          code="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "${API}/releases/tags/${TAG}")"
+          if [ "$code" = "200" ]; then
+            echo "Existing ${TAG} release found; deleting it"
+            gh release delete "${TAG}" --yes
+          fi
+
+          cat > /tmp/release-notes.md <<NOTES
+          Built from upstream smallstep/certificates @ ${{ needs.check.outputs.target_tag }}.
+          - CGO_ENABLED=1: PKCS#11 / YubiKey PIV / HSM support
+          - Go ${{ env.GO_VERSION }}: TLS 1.3 X25519MLKEM768 hybrid key exchange
+          - Assets: step-ca_linux_amd64.tar.gz, step-ca_linux_arm64.tar.gz
+          NOTES
+
+          # The release targets the upstream tag commit; no tag ref is
+          # created in this repo, so no tag-based workflows are triggered.
+          gh release create "${TAG}" \
+            --target "$(git rev-parse HEAD)" \
+            --title "step-ca ${{ needs.check.outputs.target_tag }} — linux amd64 + arm64, CGO (HSM/PKCS#11) + post-quantum (ML-KEM)" \
+            --notes-file /tmp/release-notes.md \
+            "dist/step-ca_linux_amd64.tar.gz" "dist/step-ca_linux_arm64.tar.gz"
+
+          for a in amd64 arm64; do
+            curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H 'Accept: application/vnd.github+json' \
+                 "${API}/releases/tags/${TAG}" \
+              | grep -q "step-ca_linux_${a}.tar.gz" \
+              || { echo "::error::asset step-ca_linux_${a}.tar.gz missing from ${TAG}"; exit 1; }
+          done
+          echo "Release ${TAG} published with both assets."
+
+  # -------------------------------------------------------------------------
+  prune:
+    name: Prune stale -cgo releases
+    runs-on: [github-runner-scale-set]
+    timeout-minutes: 10
+    needs: [check, build]
+    if: always() && needs.check.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub App token (step-ca-sync-bot)
+        id: app
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.REPO_APP_ID }}
+          private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
+
+      - name: Delete stale -cgo releases
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          PRUNE_TAGS: ${{ needs.check.outputs.prune_tags }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PRUNE_TAGS:-}" ]; then
+            echo "Nothing to prune."
+            exit 0
+          fi
+          API="https://api.github.com/repos/${{ github.repository }}"
+          for tag in $PRUNE_TAGS; do
+            echo "Pruning ${tag}..."
+            code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer ${APP_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              "${API}/releases/tags/${tag}")"
+            echo "  delete status: ${code}"
+          done
+
+      - name: Verify published -cgo set
+        env:
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t STABLE < <(
+            git ls-remote --tags --refs "${UPSTREAM}" \
+              | awk '{print $2}' | sed 's#refs/tags/##' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV
+          )
+          TOP3_LINE="$(printf ' %s ' "${STABLE[@]:0:3}")"
+          REMAINING="$(
+            curl -s -H "Authorization: Bearer ${APP_TOKEN}" \
+                 -H 'Accept: application/vnd.github+json' \
+                 "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
+              | grep -oE '"tag_name":"[^"]+"' \
+              | sed 's/"tag_name":"//; s/"$//' \
+              | grep -E '-cgo$' || true
+          )"
+          if [ -z "$REMAINING" ]; then
+            echo "No -cgo releases remain (will be populated by the next build)."
+            exit 0
+          fi
+          for tag in $REMAINING; do
+            base="${tag%-cgo}"
+            case "$TOP3_LINE" in
+              *" ${base} "*) echo "keep ${tag}" ;;
+              *) echo "::error::stale -cgo release remains: ${tag}"; exit 1 ;;
+            esac
+          done
+          echo "Published -cgo releases are within the three newest stable tags. OK."
