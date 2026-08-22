@@ -242,15 +242,17 @@ jobs:
             echo "::error::Expected ${STOCK} (Ubuntu noble+ image layout)"
             exit 1
           fi
+          # sudo: sed -i creates its temp file inside the root-owned dir.
           grep -q '^Architectures:' "$STOCK" \
-            || sed -i "s/^Types: deb$/&\nArchitectures: ${NATIVE}/" "$STOCK"
+            || $SUDO sed -i "s/^Types: deb$/&\nArchitectures: ${NATIVE}/" "$STOCK"
 
           if [ "$CROSS" = "arm64" ]; then
             CROSS_REPO="http://ports.ubuntu.com/ubuntu-ports"
           else
             CROSS_REPO="http://archive.ubuntu.com/ubuntu"
           fi
-          cat > /etc/apt/sources.list.d/hsm-pqc-cross.sources <<EOF
+          # sudo tee: the cross source file must land in the root-owned dir.
+          $SUDO tee /etc/apt/sources.list.d/hsm-pqc-cross.sources >/dev/null <<EOF
           Types: deb
           URIs: ${CROSS_REPO}/
           Suites: noble noble-updates noble-security
