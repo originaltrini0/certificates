@@ -362,7 +362,12 @@ jobs:
             "${API}/releases/tags/${TAG}")"
           if [ "$code" = "200" ]; then
             echo "Existing ${TAG} release found; deleting it"
-            gh release delete "${TAG}" --yes
+            del_code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              "${API}/releases/tags/${TAG}")"
+            [ "$del_code" = "200" ] || { echo "::error::failed to delete existing ${TAG} (HTTP ${del_code})"; exit 1; }
+            echo "Existing ${TAG} release deleted"
           fi
 
           cat > /tmp/release-notes.md <<NOTES
@@ -374,11 +379,47 @@ jobs:
 
           # The release targets the upstream tag commit; no tag ref is
           # created in this repo, so no tag-based workflows are triggered.
-          gh release create "${TAG}" \
-            --target "$(git rev-parse HEAD)" \
-            --title "step-ca ${{ needs.check.outputs.target_tag }} — linux amd64 + arm64, CGO (HSM/PKCS#11) + post-quantum (ML-KEM)" \
-            --notes-file /tmp/release-notes.md \
-            "dist/step-ca_linux_amd64.tar.gz" "dist/step-ca_linux_arm64.tar.gz"
+          # No gh CLI on the runner image: create via REST, then upload
+          # assets against the response's upload_url.
+          TARGET_SHA="$(git rev-parse HEAD)"
+          {
+            printf '{"tag_name":"%s","target_commit":"%s",' \
+              "${TAG}" "${TARGET_SHA}"
+            printf '"name":"%s",' \
+              "step-ca ${{ needs.check.outputs.target_tag }} — linux amd64 + arm64, CGO (HSM/PKCS#11) + post-quantum (ML-KEM)"
+            printf '"body":"'
+            sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' /tmp/release-notes.md \
+              | awk 'NR>1{printf "\\n"} {printf "%s", $0}'
+            printf '","draft":false,"prerelease":false}'
+          } > /tmp/release-payload.json
+          rel_response="$(
+            curl -s -w $'\n%{http_code}' -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'Content-Type: application/json' \
+              --data @/tmp/release-payload.json \
+              "${API}/releases"
+          )"
+          rel_status="$(printf '%s\n' "$rel_response" | tail -n1)"
+          rel_body="$(printf '%s\n' "$rel_response" | sed '$d')"
+          [ "$rel_status" = "201" ] || { echo "::error::release creation failed (HTTP ${rel_status})"; printf '%s\n' "$rel_body"; exit 1; }
+          upload_url="$(printf '%s\n' "$rel_body" \
+            | grep -oE '"upload_url":"[^"]+"' \
+            | sed 's/"upload_url":"//; s/"$//' | head -n1)"
+          [ -n "$upload_url" ] || { echo "::error::no upload_url in release response"; exit 1; }
+          upload_url="${upload_url%%\{*}" # drop the {?name,label} template part
+          for a in amd64 arm64; do
+            asset="step-ca_linux_${a}.tar.gz"
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'Content-Type: application/octet-stream' \
+              --data-binary "@dist/${asset}" \
+              "${upload_url}?name=${asset}")"
+            [ "$code" = "201" ] || { echo "::error::uploading ${asset} failed (HTTP ${code})"; exit 1; }
+            echo "Uploaded ${asset}"
+          done
 
           for a in amd64 arm64; do
             curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
