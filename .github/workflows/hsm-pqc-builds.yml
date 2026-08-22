@@ -112,6 +112,16 @@ jobs:
           client-id: ${{ secrets.REPO_APP_ID }}
           private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
 
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+          # Ephemeral runners: each job installs its own deps. Unpinned: jq
+          # only parses API responses in this workflow (never the shipped
+          # binary), and a hard version pin would pin-rot when noble bumps
+          # the package.
+          $SUDO apt-get install -y --no-install-recommends jq
+
       - name: Decide
         id: decide
         env:
@@ -140,34 +150,32 @@ jobs:
             esac
           }
 
-          # -cgo releases published in this repo (newest first).
-          # NOTE: the runner's egress proxy pretty-prints GitHub API JSON
-          # (space after every colon), so key extractions must be
-          # space-tolerant ("key": *"value"); a compact-only pattern matches
-          # nothing and silently yields an empty list.
-          mapfile -t CGO_RELEASES < <(
-            curl -sS -H "Authorization: Bearer ${APP_TOKEN}" \
-                 -H 'Accept: application/vnd.github+json' \
-                 "${RELEASE_API}?per_page=100" \
-              | grep -oE '"tag_name": *"[^"]+"' \
-              | sed 's/"tag_name": *"//; s/"$//' \
-              | grep -E '-cgo$' || true
+          # -cgo releases published in this repo (newest first). One request
+          # yields both the tag list and each release's asset count (the list
+          # endpoint embeds assets). jq parses the JSON structurally, so the
+          # egress proxy's pretty-printing cannot break extraction the way
+          # regex scraping did. curl -f fails on HTTP errors, so a failed
+          # fetch can't be mistaken for "no releases" (which would otherwise
+          # trigger a spurious build).
+          releases="$(curl -fsS -H "Authorization: Bearer ${APP_TOKEN}" \
+                -H 'Accept: application/vnd.github+json' \
+                "${RELEASE_API}?per_page=100")" \
+            || { echo "::error::GET ${RELEASE_API}: curl transport failure"; exit 1; }
+          mapfile -t CGO_PAIRS < <(
+            printf '%s' "$releases" | jq -r '
+              .[] | select((.tag_name // "") | endswith("-cgo"))
+                  | "\(.tag_name) \(.assets | length)"'
           )
-
           # Count a -cgo release only if its assets actually exist: a
           # half-published release (tag without both tarballs) would mask
           # the build gap and pin the prune set forever.
-          PUBLISHED=""
-          for tag in ${CGO_RELEASES[*]:-}; do
-            n_assets="$(curl -sS -H "Authorization: Bearer ${APP_TOKEN}" \
-              -H 'Accept: application/vnd.github+json' \
-              "${RELEASE_API}/tags/${tag}" \
-              | grep -c '"browser_download_url"' || true)"
+          CGO_RELEASES=()
+          for pair in ${CGO_PAIRS[*]:-}; do
+            tag="${pair% *}"; n_assets="${pair#* }"
             if [ "${n_assets:-0}" -ge 2 ]; then
-              PUBLISHED="${PUBLISHED} ${tag}"
+              CGO_RELEASES+=("$tag")
             fi
           done
-          CGO_RELEASES=(${PUBLISHED:-})
 
           FORCE="${{ inputs.force_rebuild }}"
 
@@ -227,6 +235,16 @@ jobs:
         with:
           client-id: ${{ secrets.REPO_APP_ID }}
           private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
+
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+          # Ephemeral runners: each job installs its own deps. Unpinned: jq
+          # only parses API responses in this workflow (never the shipped
+          # binary), and a hard version pin would pin-rot when noble bumps
+          # the package.
+          $SUDO apt-get install -y --no-install-recommends jq
 
       - name: Checkout upstream release tag
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -384,11 +402,13 @@ jobs:
             || { echo "::error::GET ${TAG}: curl transport failure"; exit 1; }
           if [ "$code" = "200" ]; then
             echo "Existing ${TAG} release found; deleting it"
-            del_id="$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            del_id="$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" \
               -H 'Accept: application/vnd.github+json' \
               "${API}/releases/tags/${TAG}" \
-              | grep -oE '"id": *[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
-            [ -n "$del_id" ] || { echo "::error::could not resolve release id for ${TAG}"; exit 1; }
+              | jq -er '.id')" \
+              || { echo "::error::GET ${TAG}/resolve-id failed"; exit 1; }
+            [ -n "${del_id:-}" ] && [ "$del_id" != "null" ] \
+              || { echo "::error::could not resolve release id for ${TAG}"; exit 1; }
             del_code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H 'Accept: application/vnd.github+json' \
@@ -431,10 +451,9 @@ jobs:
           rel_status="$(printf '%s\n' "$rel_response" | tail -n1)"
           rel_body="$(printf '%s\n' "$rel_response" | sed '$d')"
           [ "$rel_status" = "201" ] || { echo "::error::release creation failed (HTTP ${rel_status})"; printf '%s\n' "$rel_body"; exit 1; }
-          # Space-tolerant: the egress proxy pretty-prints JSON (see check job).
-          upload_url="$(printf '%s\n' "$rel_body" \
-            | grep -oE '"upload_url": *"[^"]+"' \
-            | sed 's/"upload_url": *"//; s/"$//' | head -n1)" \
+          # jq parses structurally (the egress proxy pretty-prints JSON), so
+          # the extraction is immune to indentation/formatting changes.
+          upload_url="$(printf '%s' "$rel_body" | jq -er '.upload_url')" \
             || { echo "::error::no upload_url in 201 release response"; printf '%s\n' "$rel_body" | head -c 3000; exit 1; }
           upload_url="${upload_url%%\{*}" # drop the {?name,label} template part
           for a in amd64 arm64; do
@@ -479,6 +498,16 @@ jobs:
           client-id: ${{ secrets.REPO_APP_ID }}
           private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
 
+      - name: Install jq
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" = "0" ]; then SUDO=""; else SUDO="sudo"; fi
+          # Ephemeral runners: each job installs its own deps. Unpinned: jq
+          # only parses API responses in this workflow (never the shipped
+          # binary), and a hard version pin would pin-rot when noble bumps
+          # the package.
+          $SUDO apt-get install -y --no-install-recommends jq
+
       - name: Delete stale -cgo releases
         env:
           APP_TOKEN: ${{ steps.app.outputs.token }}
@@ -494,11 +523,14 @@ jobs:
           # DELETE /releases/{id} works.
           for tag in $PRUNE_TAGS; do
             echo "Pruning ${tag}..."
-            rid="$(curl -sS -H "Authorization: Bearer ${APP_TOKEN}" \
+            if ! rid="$(curl -fsS -H "Authorization: Bearer ${APP_TOKEN}" \
               -H 'Accept: application/vnd.github+json' \
               "${API}/releases/tags/${tag}" \
-              | grep -oE '"id": *[0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
-            if [ -z "$rid" ]; then
+              | jq -er '.id' 2>/dev/null)"; then
+              echo "  ${tag}: no release found (already pruned)."
+              continue
+            fi
+            if [ -z "$rid" ] || [ "$rid" = "null" ]; then
               echo "  ${tag}: no release found (already pruned)."
               continue
             fi
@@ -522,15 +554,15 @@ jobs:
               | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV
           )
           TOP3_LINE="$(printf ' %s ' "${STABLE[@]:0:3}")"
-          # Space-tolerant tag_name extraction (pretty JSON from egress).
+          # jq parses the release list structurally, independent of how the
+          # egress proxy formats the JSON.
           REMAINING="$(
-            curl -sS -H "Authorization: Bearer ${APP_TOKEN}" \
+            curl -fsS -H "Authorization: Bearer ${APP_TOKEN}" \
                  -H 'Accept: application/vnd.github+json' \
                  "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
-              | grep -oE '"tag_name": *"[^"]+"' \
-              | sed 's/"tag_name": *"//; s/"$//' \
-              | grep -E '-cgo$' || true
-          )"
+              | jq -r '.[] | select((.tag_name // "") | endswith("-cgo")) | .tag_name'
+          )" \
+            || { echo "::error::GET releases list: curl/parse failure"; exit 1; }
           if [ -z "$REMAINING" ]; then
             echo "No -cgo releases remain (will be populated by the next build)."
             exit 0
