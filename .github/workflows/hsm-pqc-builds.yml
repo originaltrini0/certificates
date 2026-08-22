@@ -141,12 +141,16 @@ jobs:
           }
 
           # -cgo releases published in this repo (newest first).
+          # NOTE: the runner's egress proxy pretty-prints GitHub API JSON
+          # (space after every colon), so key extractions must be
+          # space-tolerant ("key": *"value"); a compact-only pattern matches
+          # nothing and silently yields an empty list.
           mapfile -t CGO_RELEASES < <(
             curl -sS -H "Authorization: Bearer ${APP_TOKEN}" \
                  -H 'Accept: application/vnd.github+json' \
                  "${RELEASE_API}?per_page=100" \
-              | grep -oE '"tag_name":"[^"]+"' \
-              | sed 's/"tag_name":"//; s/"$//' \
+              | grep -oE '"tag_name": *"[^"]+"' \
+              | sed 's/"tag_name": *"//; s/"$//' \
               | grep -E '-cgo$' || true
           )
 
@@ -427,9 +431,10 @@ jobs:
           rel_status="$(printf '%s\n' "$rel_response" | tail -n1)"
           rel_body="$(printf '%s\n' "$rel_response" | sed '$d')"
           [ "$rel_status" = "201" ] || { echo "::error::release creation failed (HTTP ${rel_status})"; printf '%s\n' "$rel_body"; exit 1; }
+          # Space-tolerant: the egress proxy pretty-prints JSON (see check job).
           upload_url="$(printf '%s\n' "$rel_body" \
-            | grep -oE '"upload_url":"[^"]+"' \
-            | sed 's/"upload_url":"//; s/"$//' | head -n1)" \
+            | grep -oE '"upload_url": *"[^"]+"' \
+            | sed 's/"upload_url": *"//; s/"$//' | head -n1)" \
             || { echo "::error::no upload_url in 201 release response"; printf '%s\n' "$rel_body" | head -c 3000; exit 1; }
           upload_url="${upload_url%%\{*}" # drop the {?name,label} template part
           for a in amd64 arm64; do
@@ -517,12 +522,13 @@ jobs:
               | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -rV
           )
           TOP3_LINE="$(printf ' %s ' "${STABLE[@]:0:3}")"
+          # Space-tolerant tag_name extraction (pretty JSON from egress).
           REMAINING="$(
-            curl -s -H "Authorization: Bearer ${APP_TOKEN}" \
+            curl -sS -H "Authorization: Bearer ${APP_TOKEN}" \
                  -H 'Accept: application/vnd.github+json' \
                  "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" \
-              | grep -oE '"tag_name":"[^"]+"' \
-              | sed 's/"tag_name":"//; s/"$//' \
+              | grep -oE '"tag_name": *"[^"]+"' \
+              | sed 's/"tag_name": *"//; s/"$//' \
               | grep -E '-cgo$' || true
           )"
           if [ -z "$REMAINING" ]; then
