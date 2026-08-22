@@ -328,6 +328,7 @@ jobs:
           set -euo pipefail
           for arch in amd64 arm64; do
             tar -xzOf "dist/step-ca_linux_${arch}.tar.gz" step-ca > "/tmp/step-ca-${arch}"
+            chmod +x "/tmp/step-ca-${arch}" # stdout extraction loses the exec bit
             grep -qaE 'pcsc|pkcs11' "/tmp/step-ca-${arch}" \
               || { echo "::error::${arch}: no PCSC/PKCS#11 symbols (CGO not compiled in)"; exit 1; }
             grep -qa 'mlkem' "/tmp/step-ca-${arch}" \
