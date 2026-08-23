@@ -28,76 +28,10 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  sync-upstream:
-    name: Keep hsm+pqc-builds mirror of upstream master
-    runs-on: [github-runner-scale-set]
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - name: Create GitHub App token (step-ca-sync-bot)
-        id: app
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ secrets.REPO_APP_ID }}
-          private-key: ${{ secrets.REPO_APP_PRIVATE_KEY }}
-
-      # Fresh clone so the rebase never depends on the runner's implicit
-      # checkout. Fork-side commits on this branch (if any) are rebased
-      # onto upstream master and survive; no other branch is touched
-      # (master stays a clean upstream mirror).
-      - name: Sync hsm+pqc-builds to upstream master
-        env:
-          APP_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          cat > ./git-askpass.sh <<'EOF'
-          #!/bin/sh
-          case "$1" in
-            *Username*) echo "x-access-token" ;;
-            *Password*) echo "$APP_TOKEN" ;;
-            *) exit 1 ;;
-          esac
-          EOF
-          chmod +x ./git-askpass.sh
-          export GIT_ASKPASS="$PWD/git-askpass.sh" GIT_TERMINAL_PROMPT=0
-
-          WORK="$(mktemp -d)"
-          trap 'rm -rf "$WORK"' EXIT
-          cd "$WORK"
-          git init -q
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git remote add upstream "${UPSTREAM}"
-          git fetch -q upstream '+refs/heads/master:refs/remotes/upstream/master'
-          git fetch -q origin 'refs/heads/hsm+pqc-builds:refs/heads/hsm+pqc-builds'
-          git checkout -q hsm+pqc-builds
-          if git merge-base --is-ancestor HEAD upstream/master; then
-            # No fork-side commits: fast-forward this branch to upstream master.
-            git reset --hard upstream/master
-          else
-            # Fork-side commits exist on this branch: rebase them onto
-            # upstream master.
-            git rebase upstream/master
-          fi
-
-          git config user.name "step-ca-sync-bot"
-          git config user.email "step-ca-sync-bot@users.noreply.github.com"
-          git push --force origin "HEAD:refs/heads/hsm+pqc-builds"
-
-          want="$(git rev-parse HEAD)"
-          got="$(git ls-remote origin 'refs/heads/hsm+pqc-builds' | cut -f1)"
-          if [ "$want" != "$got" ]; then
-            echo "::error::Push verification failed: want $want, got ${got:-<absent>}"
-            exit 1
-          fi
-          echo "hsm+pqc-builds -> $got"
-
-  # -------------------------------------------------------------------------
   check:
     name: Decide build target and prune set
     runs-on: [github-runner-scale-set]
     timeout-minutes: 10
-    needs: sync-upstream
     permissions:
       contents: read
     outputs:
