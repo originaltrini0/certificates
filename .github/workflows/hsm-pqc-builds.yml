@@ -276,7 +276,7 @@ jobs:
         run: |
           set -euo pipefail
           unset GITHUB_REF # version is derived from the checked-out tag
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=1 CC="$CC_AMD64" make build
+          GOOS=linux GOARCH=amd64 CC="$CC_AMD64" make V=1 build GO_ENVS="CGO_ENABLED=1"
           machine="$(od -An -j18 -N2 -tu2 bin/step-ca | tr -d ' ')"
           [ "$machine" = "62" ] || { echo "::error::amd64 binary is not x86_64 ELF (machine ${machine})"; exit 1; }
           mkdir -p dist
@@ -288,7 +288,7 @@ jobs:
           set -euo pipefail
           rm -f bin/step-ca
           unset GITHUB_REF
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC="$CC_ARM64" make build
+          GOOS=linux GOARCH=arm64 CC="$CC_ARM64" make V=1 build GO_ENVS="CGO_ENABLED=1"
           machine="$(od -An -j18 -N2 -tu2 bin/step-ca | tr -d ' ')"
           [ "$machine" = "183" ] || { echo "::error::arm64 binary is not AArch64 ELF (machine ${machine})"; exit 1; }
           tar -czf dist/step-ca_linux_arm64.tar.gz -C bin step-ca
@@ -300,6 +300,8 @@ jobs:
           for arch in amd64 arm64; do
             tar -xzOf "dist/step-ca_linux_${arch}.tar.gz" step-ca > "/tmp/step-ca-${arch}"
             chmod +x "/tmp/step-ca-${arch}" # stdout extraction loses the exec bit
+            grep -qa 'libpcsclite\.so\.' "/tmp/step-ca-${arch}" \
+              || { echo "::error::${arch}: no libpcsclite linkage in NEEDED (CGO not enabled)"; exit 1; }
             grep -qaE 'pcsc|pkcs11' "/tmp/step-ca-${arch}" \
               || { echo "::error::${arch}: no PCSC/PKCS#11 symbols (CGO not compiled in)"; exit 1; }
             grep -qa 'mlkem' "/tmp/step-ca-${arch}" \
