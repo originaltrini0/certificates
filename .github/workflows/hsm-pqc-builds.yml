@@ -237,8 +237,18 @@ jobs:
 
           case "$HOST" in
             x86_64)
+              # A bare `gcc` does NOT install the native glibc headers (those
+              # come from build-essential/libc6-dev); without them the
+              # native-arch cgo build dies on `stdlib.h: No such file or
+              # directory`. We only got the cross libc6-dev here, which does
+              # nothing for the native build. `libc6-dev` and `pkg-config` are
+              # unpinned on purpose (like jq so they don't pin-rot when noble
+              # bumps them); pkg-config is required by cgo to resolve
+              # `#cgo pkg-config: libpcsclite` (go-piv/piv-go).
               $SUDO apt-get install -y --no-install-recommends \
                 gcc=4:13.2.0-7ubuntu1 \
+                libc6-dev \
+                pkg-config \
                 crossbuild-essential-arm64=12.10ubuntu1 \
                 gcc-aarch64-linux-gnu=4:13.2.0-7ubuntu1 \
                 libc6-dev-arm64-cross=2.39-0ubuntu8cross1 \
@@ -250,8 +260,12 @@ jobs:
               { echo "CC_AMD64=${CC_AMD64}"; echo "CC_ARM64=${CC_ARM64}"; } >> "$GITHUB_ENV"
               ;;
             aarch64)
+              # Mirror of the x86_64 branch: a stock `gcc` leaves the native
+              # glibc headers and pkg-config out of the install.
               $SUDO apt-get install -y --no-install-recommends \
                 gcc=4:13.2.0-7ubuntu1 \
+                libc6-dev \
+                pkg-config \
                 crossbuild-essential-amd64=12.10ubuntu1 \
                 gcc-x86_64-linux-gnu=4:13.2.0-7ubuntu1 \
                 libc6-dev-amd64-cross=2.39-0ubuntu8cross1 \
@@ -265,7 +279,27 @@ jobs:
           esac
           command -v "$CC_AMD64" >/dev/null
           command -v "$CC_ARM64" >/dev/null
-          echo "CC_AMD64=$CC_AMD64 CC_ARM64=$CC_ARM64"
+          command -v pkg-config >/dev/null
+
+          # libpcsclite is linked via cgo through `pkg-config` (see
+          # go-piv/piv-go). When cross-compiling, pkg-config's default
+          # search path is the *host* arch, so point it at the target-arch
+          # .pc dir so cgo resolves -I/-L for the right architecture.
+          # Works for both native and cross builds (dpkg -L pkg:arch
+          # resolves the right copy in either case).
+          pcdir() {
+            local p pkg
+            for pkg in "$1" "libpcsclite-dev"; do
+              p="$(dpkg -L "$pkg" 2>/dev/null | grep -E '/pkgconfig/[^/]*\.pc$' | head -n1 || true)"
+              if [ -n "$p" ]; then dirname "$p"; return 0; fi
+            done
+            return 0
+          }
+          PC_AMD64="$(pcdir 'libpcsclite-dev:amd64')"
+          PC_ARM64="$(pcdir 'libpcsclite-dev:arm64')"
+          { echo "PKG_CONFIG_PATH_AMD64=${PC_AMD64:-}"
+            echo "PKG_CONFIG_PATH_ARM64=${PC_ARM64:-}"; } >> "$GITHUB_ENV"
+          echo "CC_AMD64=$CC_AMD64 CC_ARM64=$CC_ARM64 PC_AMD64=${PC_AMD64:-<native default>} PC_ARM64=${PC_ARM64:-<native default>}"
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -276,9 +310,15 @@ jobs:
         run: |
           set -euo pipefail
           unset GITHUB_REF # version is derived from the checked-out tag
+          # cgo links libpcsclite through `pkg-config`; point it at the target
+          # arch's .pc dir so the cross build gets the arm64 lib, not the host's.
+          if [ -n "${PKG_CONFIG_PATH_AMD64:-}" ]; then
+            export PKG_CONFIG_PATH="${PKG_CONFIG_PATH_AMD64}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+          fi
+          pkg-config --exists libpcsclite || { echo "::error::pkg-config cannot find libpcsclite for amd64 (PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<default>})"; exit 1; }
           GOOS=linux GOARCH=amd64 CC="$CC_AMD64" make V=1 build GO_ENVS="CGO_ENABLED=1"
           machine="$(od -An -j18 -N2 -tu2 bin/step-ca | tr -d ' ')"
-          [ "$machine" = "62" ] || { echo "::error::amd64 binary is not x86_64 ELF (machine ${machine})"; exit 1; }
+          [ "$machine" = "62" ] || { echo "::error::amd64 binary is not x86_64 ELF (machine ${machine:-?}) -- cgo build produced the wrong arch or no binary"; exit 1; }
           mkdir -p dist
           tar -czf dist/step-ca_linux_amd64.tar.gz -C bin step-ca
           echo "Built amd64: $(ls -lh dist/step-ca_linux_amd64.tar.gz)"
@@ -288,9 +328,13 @@ jobs:
           set -euo pipefail
           rm -f bin/step-ca
           unset GITHUB_REF
+          if [ -n "${PKG_CONFIG_PATH_ARM64:-}" ]; then
+            export PKG_CONFIG_PATH="${PKG_CONFIG_PATH_ARM64}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+          fi
+          pkg-config --exists libpcsclite || { echo "::error::pkg-config cannot find libpcsclite for arm64 (PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-<default>})"; exit 1; }
           GOOS=linux GOARCH=arm64 CC="$CC_ARM64" make V=1 build GO_ENVS="CGO_ENABLED=1"
           machine="$(od -An -j18 -N2 -tu2 bin/step-ca | tr -d ' ')"
-          [ "$machine" = "183" ] || { echo "::error::arm64 binary is not AArch64 ELF (machine ${machine})"; exit 1; }
+          [ "$machine" = "183" ] || { echo "::error::arm64 binary is not AArch64 ELF (machine ${machine:-?}) -- cgo build produced the wrong arch or no binary"; exit 1; }
           tar -czf dist/step-ca_linux_arm64.tar.gz -C bin step-ca
           echo "Built arm64: $(ls -lh dist/step-ca_linux_arm64.tar.gz)"
 
